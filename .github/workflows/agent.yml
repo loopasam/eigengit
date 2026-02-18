@@ -1,0 +1,33 @@
+name: Self-Writing Agent
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  agent:
+    # Only run when the "agent" label is added
+    if: github.event.label.name == 'agent'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AGENT_GH_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run agent
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: npx tsx agent.ts

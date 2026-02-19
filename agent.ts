@@ -7,6 +7,8 @@
 import { execSync } from "child_process";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "fs";
 import { join, dirname, extname } from "path";
+import { ResponseValidator, ContentSanitizer, DEFAULT_VALIDATION_CONFIG } from "./lib/validation.js";
+import { RollbackManager } from "./lib/rollback.js";
 
 // --- Config from environment ---
 const GH_TOKEN = env("GH_TOKEN");
@@ -228,18 +230,32 @@ function parseIssueInstructions(content: string): IssueInput[] {
 async function main() {
   console.log(`Processing issue #${ISSUE_NUMBER} in ${REPO}`);
 
-  // 1. Fetch the issue
-  const issue = await ghApi<{ title: string; body?: string }>(
-    "GET",
-    `/repos/${REPO}/issues/${ISSUE_NUMBER}`
-  );
-  console.log(`Issue: ${issue.title}`);
+  // Initialize validation and rollback systems
+  const validator = new ResponseValidator(DEFAULT_VALIDATION_CONFIG);
+  const rollbackManager = new RollbackManager();
+  
+  // Validate git state
+  if (!rollbackManager.validateGitState()) {
+    throw new Error("Git working directory is not clean or not in a git repository");
+  }
 
-  // 2. Gather current codebase
-  const codebase = gatherCodebase();
+  // Create rollback snapshot
+  const snapshotId = `issue-${ISSUE_NUMBER}-${Date.now()}`;
+  rollbackManager.createSnapshot(snapshotId);
 
-  // 3. Build prompt
-  const prompt = `You are a coding agent. Your job is to modify a codebase based on a GitHub issue.
+  try {
+    // 1. Fetch the issue
+    const issue = await ghApi<{ title: string; body?: string }>(
+      "GET",
+      `/repos/${REPO}/issues/${ISSUE_NUMBER}`
+    );
+    console.log(`Issue: ${issue.title}`);
+
+    // 2. Gather current codebase
+    const codebase = gatherCodebase();
+
+    // 3. Build prompt
+    const prompt = `You are a coding agent. Your job is to modify a codebase based on a GitHub issue.
 
 ## IMPORTANT RULES
 - Output ONLY the files that need to be created or modified AND any issues to create.
@@ -276,100 +292,181 @@ ${issue.body ?? ""}
 ${codebase}
 `;
 
-  // 4. Call Claude
-  console.log("Calling Claude...");
-  const response = await callClaude(prompt);
-  console.log(`Got response (${response.length} chars)`);
+    // 4. Call Claude
+    console.log("Calling Claude...");
+    const response = await callClaude(prompt);
+    console.log(`Got response (${response.length} chars)`);
 
-  // 5. Parse issue creation instructions first
-  const issuesToCreate = parseIssueInstructions(response);
-  console.log(`Found ${issuesToCreate.length} issues to create`);
-
-  // Create the issues
-  const createdIssues: { title: string; url: string; number: number }[] = [];
-  for (const issueData of issuesToCreate) {
-    try {
-      const createdIssue = await createGitHubIssue(issueData);
-      createdIssues.push({
-        title: issueData.title,
-        url: createdIssue.html_url,
-        number: createdIssue.number
-      });
-    } catch (error) {
-      console.error(`Failed to create issue "${issueData.title}":`, error);
-    }
-  }
-
-  // 6. Parse file blocks
-  const changes = parseFileBlocks(response);
-  if (changes.length === 0 && createdIssues.length === 0) {
-    console.log("No file changes or issues parsed. Raw response (first 2000 chars):");
-    console.log(response.slice(0, 2000));
-    await ghApi("POST", `/repos/${REPO}/issues/${ISSUE_NUMBER}/comments`, {
-      body: "Agent ran but could not parse any file changes or issue creation instructions from the LLM response.",
-    });
-    process.exit(1);
-  }
-
-  console.log(`Parsed ${changes.length} file(s):`);
-  for (const c of changes) console.log(`  - ${c.path}`);
-
-  // 7. Create branch and apply changes (only if there are file changes)
-  let prUrl = "";
-  if (changes.length > 0) {
-    const branch = `agent/issue-${ISSUE_NUMBER}`;
-    run(`git checkout -b ${branch}`);
-
-    for (const { path, content } of changes) {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, content, "utf-8");
-      run(`git add "${path}"`);
+    // 5. Validate response format
+    const formatValidation = validator.validateResponseFormat(response);
+    if (!formatValidation.valid) {
+      console.error("Response format validation failed:");
+      formatValidation.errors.forEach(error => console.error(`  - ${error}`));
+      throw new Error("Invalid response format from LLM");
     }
 
-    // 8. Commit and push
-    run('git config user.name "self-agent"');
-    run('git config user.email "agent@noreply"');
-    run(`git commit -m "Agent: ${issue.title} (#${ISSUE_NUMBER})"`);
-    run(`git push origin ${branch}`);
+    if (formatValidation.warnings.length > 0) {
+      console.warn("Response format warnings:");
+      formatValidation.warnings.forEach(warning => console.warn(`  - ${warning}`));
+    }
 
-    // 9. Open PR
-    const pr = await ghApi<{ html_url: string }>(
-      "POST",
-      `/repos/${REPO}/pulls`,
-      {
-        title: `Agent: ${issue.title}`,
-        head: branch,
-        base: "main",
-        body: `Automated changes for #${ISSUE_NUMBER}.\n\nReview carefully before merging.`,
+    // 6. Parse issue creation instructions first
+    const issuesToCreate = parseIssueInstructions(response);
+    console.log(`Found ${issuesToCreate.length} issues to create`);
+
+    // Create the issues
+    const createdIssues: { title: string; url: string; number: number }[] = [];
+    for (const issueData of issuesToCreate) {
+      try {
+        const createdIssue = await createGitHubIssue(issueData);
+        createdIssues.push({
+          title: issueData.title,
+          url: createdIssue.html_url,
+          number: createdIssue.number
+        });
+      } catch (error) {
+        console.error(`Failed to create issue "${issueData.title}":`, error);
       }
-    );
-    prUrl = pr.html_url;
-    console.log(`PR created: ${prUrl}`);
-  }
-
-  // 10. Comment on issue with results
-  let commentBody = "";
-  
-  if (prUrl) {
-    commentBody += `I've opened a PR with the proposed changes: ${prUrl}\n\n`;
-  }
-  
-  if (createdIssues.length > 0) {
-    commentBody += `I've also created ${createdIssues.length} additional issue(s):\n`;
-    for (const issue of createdIssues) {
-      commentBody += `- #${issue.number}: ${issue.title} (${issue.url})\n`;
     }
-  }
-  
-  if (!commentBody) {
-    commentBody = "Agent processed the issue but no changes or additional issues were needed.";
-  }
 
-  await ghApi("POST", `/repos/${REPO}/issues/${ISSUE_NUMBER}/comments`, {
-    body: commentBody.trim(),
-  });
+    // 7. Parse and validate file blocks
+    const changes = parseFileBlocks(response);
+    
+    if (changes.length === 0 && createdIssues.length === 0) {
+      console.log("No file changes or issues parsed. Raw response (first 2000 chars):");
+      console.log(response.slice(0, 2000));
+      await ghApi("POST", `/repos/${REPO}/issues/${ISSUE_NUMBER}/comments`, {
+        body: "Agent ran but could not parse any file changes or issue creation instructions from the LLM response.",
+      });
+      process.exit(1);
+    }
 
-  console.log("Done!");
+    // 8. Validate changes if any exist
+    let prUrl = "";
+    if (changes.length > 0) {
+      console.log(`Parsed ${changes.length} file(s):`);
+      for (const c of changes) console.log(`  - ${c.path}`);
+
+      // Comprehensive validation
+      const validation = validator.validateChanges(response, changes);
+      
+      if (!validation.valid) {
+        console.error("Validation failed:");
+        validation.errors.forEach(error => console.error(`  - ${error}`));
+        
+        // Comment on the issue about validation failure
+        await ghApi("POST", `/repos/${REPO}/issues/${ISSUE_NUMBER}/comments`, {
+          body: `Agent validation failed:\n\n${validation.errors.map(e => `- ${e}`).join('\n')}\n\nNo changes were applied.`,
+        });
+        
+        throw new Error("Validation failed - changes rejected for safety");
+      }
+
+      if (validation.warnings.length > 0) {
+        console.warn("Validation warnings:");
+        validation.warnings.forEach(warning => console.warn(`  - ${warning}`));
+      }
+
+      // 9. Apply changes with safety measures
+      const branch = `agent/issue-${ISSUE_NUMBER}`;
+      run(`git checkout -b ${branch}`);
+
+      try {
+        for (const change of changes) {
+          // Track file for rollback
+          rollbackManager.trackChange(snapshotId, change.path);
+          
+          // Sanitize content
+          const sanitizedContent = ContentSanitizer.normalizeContent(
+            ContentSanitizer.sanitizeContent(change.content, change.path)
+          );
+          
+          // Create directory and write file
+          mkdirSync(dirname(change.path), { recursive: true });
+          writeFileSync(change.path, sanitizedContent, "utf-8");
+          run(`git add "${change.path}"`);
+        }
+
+        // 10. Commit and push with validation check
+        run('git config user.name "self-agent"');
+        run('git config user.email "agent@noreply"');
+        run(`git commit -m "Agent: ${issue.title} (#${ISSUE_NUMBER})"`);
+        
+        // Final validation: check if commit was created successfully
+        const commitHash = run('git rev-parse HEAD').trim();
+        console.log(`Created commit: ${commitHash}`);
+        
+        run(`git push origin ${branch}`);
+
+        // 11. Open PR
+        const pr = await ghApi<{ html_url: string }>(
+          "POST",
+          `/repos/${REPO}/pulls`,
+          {
+            title: `Agent: ${issue.title}`,
+            head: branch,
+            base: "main",
+            body: `Automated changes for #${ISSUE_NUMBER}.\n\n**Validation Results:**\n${validation.warnings.length > 0 ? `Warnings:\n${validation.warnings.map(w => `- ${w}`).join('\n')}\n\n` : ''}Review carefully before merging.\n\n**Safety measures applied:**\n- Response format validated\n- File paths sanitized\n- Content validated and normalized\n- Rollback snapshot created: \`${snapshotId}\``,
+          }
+        );
+        prUrl = pr.html_url;
+        console.log(`PR created: ${prUrl}`);
+
+      } catch (error) {
+        console.error("Error applying changes:", error);
+        
+        // Attempt rollback
+        try {
+          console.log("Attempting rollback...");
+          rollbackManager.rollbackToSnapshot(snapshotId);
+          console.log("Rollback completed successfully");
+        } catch (rollbackError) {
+          console.error("Rollback failed:", rollbackError);
+        }
+        
+        throw error;
+      }
+    }
+
+    // 12. Comment on issue with results
+    let commentBody = "";
+    
+    if (prUrl) {
+      commentBody += `I've opened a PR with the proposed changes: ${prUrl}\n\n`;
+      commentBody += `**Safety measures applied:**\n`;
+      commentBody += `- ✅ Response format validated\n`;
+      commentBody += `- ✅ File paths sanitized\n`;
+      commentBody += `- ✅ Content validated and normalized\n`;
+      commentBody += `- ✅ Rollback snapshot created\n\n`;
+    }
+    
+    if (createdIssues.length > 0) {
+      commentBody += `I've also created ${createdIssues.length} additional issue(s):\n`;
+      for (const issue of createdIssues) {
+        commentBody += `- #${issue.number}: ${issue.title} (${issue.url})\n`;
+      }
+    }
+    
+    if (!commentBody) {
+      commentBody = "Agent processed the issue but no changes or additional issues were needed.";
+    }
+
+    await ghApi("POST", `/repos/${REPO}/issues/${ISSUE_NUMBER}/comments`, {
+      body: commentBody.trim(),
+    });
+
+    console.log("Done!");
+
+  } catch (error) {
+    console.error("Agent execution failed:", error);
+    
+    // Comment on issue about the failure
+    await ghApi("POST", `/repos/${REPO}/issues/${ISSUE_NUMBER}/comments`, {
+      body: `Agent execution failed: ${error instanceof Error ? error.message : 'Unknown error'}\n\nRollback snapshot available: \`${snapshotId}\``,
+    });
+    
+    throw error;
+  }
 }
 
 main().catch((err) => {
